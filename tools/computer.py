@@ -94,8 +94,12 @@ class ComputerTool(BaseAnthropicTool):
         super().__init__()
 
         self.width, self.height = pyautogui.size()
+
         assert self.width and self.height, "WIDTH, HEIGHT must be set"
-        self.display_num = None  # macOS doesn't use X11 display numbers
+
+        # Read display number from environment variable
+        display_num_str = os.getenv("DISPLAY_NUM")
+        self.display_num = int(display_num_str) if display_num_str is not None else None
 
     async def __call__(
         self,
@@ -116,7 +120,9 @@ class ComputerTool(BaseAnthropicTool):
             if not all(isinstance(i, int) and i >= 0 for i in coordinate):
                 raise ToolError(f"{coordinate} must be a tuple of non-negative ints")
 
-            x, y = self.scale_coordinates(ScalingSource.API, coordinate[0], coordinate[1])
+            x, y = self.scale_coordinates(
+                ScalingSource.API, coordinate[0], coordinate[1]
+            )
 
             if action == "mouse_move":
                 return await self.shell(f"cliclick m:{x},{y}")
@@ -146,7 +152,7 @@ class ComputerTool(BaseAnthropicTool):
                     "cmd": "command",
                     "alt": "alt",
                     "shift": "shift",
-                    "ctrl": "ctrl"
+                    "ctrl": "ctrl",
                 }
 
                 try:
@@ -155,7 +161,7 @@ class ComputerTool(BaseAnthropicTool):
                         keys = text.split("+")
                         mapped_keys = [key_map.get(k.strip(), k.strip()) for k in keys]
                         await asyncio.get_event_loop().run_in_executor(
-                            None, keyboard.press_and_release, '+'.join(mapped_keys)
+                            None, keyboard.press_and_release, "+".join(mapped_keys)
                         )
                     else:
                         # Handle single keys
@@ -164,7 +170,9 @@ class ComputerTool(BaseAnthropicTool):
                             None, keyboard.press_and_release, mapped_key
                         )
 
-                    return ToolResult(output=f"Pressed key: {text}", error=None, base64_image=None)
+                    return ToolResult(
+                        output=f"Pressed key: {text}", error=None, base64_image=None
+                    )
 
                 except Exception as e:
                     return ToolResult(output=None, error=str(e), base64_image=None)
@@ -200,7 +208,7 @@ class ComputerTool(BaseAnthropicTool):
                     "cliclick p",
                     take_screenshot=False,
                 )
-                import pdb; pdb.set_trace()
+
                 if result.output:
                     x, y = map(int, result.output.strip().split(","))
                     x, y = self.scale_coordinates(ScalingSource.COMPUTER, x, y)
@@ -224,14 +232,17 @@ class ComputerTool(BaseAnthropicTool):
         path = output_dir / f"screenshot_{uuid4().hex}.png"
 
         # Use macOS native screencapture
-        screenshot_cmd = f"screencapture -x {path}"
+        # If display_num is set, use it to capture specific display
+        display_flag = f"-D {self.display_num}" if self.display_num is not None else ""
+        screenshot_cmd = f"screencapture -x {display_flag} {path}"
+        print("screenshot_cmd", screenshot_cmd)
         result = await self.shell(screenshot_cmd, take_screenshot=False)
 
         if self._scaling_enabled:
-            x, y = SCALE_DESTINATION['width'], SCALE_DESTINATION['height']
+            x, y = SCALE_DESTINATION["width"], SCALE_DESTINATION["height"]
             await self.shell(
                 f"sips -z {y} {x} {path}",  # sips is macOS native image processor
-                take_screenshot=False
+                take_screenshot=False,
             )
 
         if path.exists():
@@ -252,7 +263,9 @@ class ComputerTool(BaseAnthropicTool):
 
         return ToolResult(output=stdout, error=stderr, base64_image=base64_image)
 
-    def scale_coordinates(self, source: ScalingSource, x: int, y: int) -> tuple[int, int]:
+    def scale_coordinates(
+        self, source: ScalingSource, x: int, y: int
+    ) -> tuple[int, int]:
         """
         Scale coordinates between original resolution and target resolution (SCALE_DESTINATION).
 
@@ -268,13 +281,15 @@ class ComputerTool(BaseAnthropicTool):
             return x, y
 
         # Calculate scaling factors
-        x_scaling_factor = SCALE_DESTINATION['width'] / self.width
-        y_scaling_factor = SCALE_DESTINATION['height'] / self.height
+        x_scaling_factor = SCALE_DESTINATION["width"] / self.width
+        y_scaling_factor = SCALE_DESTINATION["height"] / self.height
 
         if source == ScalingSource.API:
             # Scale up from SCALE_DESTINATION to original resolution
-            if x > SCALE_DESTINATION['width'] or y > SCALE_DESTINATION['height']:
-                raise ToolError(f"Coordinates {x}, {y} are out of bounds for {SCALE_DESTINATION['width']}x{SCALE_DESTINATION['height']}")
+            if x > SCALE_DESTINATION["width"] or y > SCALE_DESTINATION["height"]:
+                raise ToolError(
+                    f"Coordinates {x}, {y} are out of bounds for {SCALE_DESTINATION['width']}x{SCALE_DESTINATION['height']}"
+                )
             return round(x / x_scaling_factor), round(y / y_scaling_factor)
         else:
             # Scale down from original resolution to SCALE_DESTINATION
