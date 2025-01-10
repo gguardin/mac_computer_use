@@ -45,7 +45,7 @@ MAX_SCALING_TARGETS: dict[str, Resolution] = {
     "WXGA": Resolution(width=1280, height=800),  # 16:10
     "FWXGA": Resolution(width=1366, height=768),  # ~16:9
 }
-SCALE_DESTINATION = MAX_SCALING_TARGETS["FWXGA"]
+SCALE_DESTINATION = MAX_SCALING_TARGETS["XGA"]
 
 
 class ScalingSource(StrEnum):
@@ -76,14 +76,17 @@ class ComputerTool(BaseAnthropicTool):
     height: int
     display_num: int | None
 
-    _screenshot_delay = 1.0  # macOS is generally faster than X11
+    _screenshot_delay = 1.0
     _scaling_enabled = True
 
     @property
     def options(self) -> ComputerToolOptions:
+        width, height = self.scale_coordinates(
+            ScalingSource.COMPUTER, self.width, self.height
+        )
         return {
-            "display_width_px": self.width,
-            "display_height_px": self.height,
+            "display_width_px": width,
+            "display_height_px": height,
             "display_number": self.display_num,
         }
 
@@ -93,7 +96,10 @@ class ComputerTool(BaseAnthropicTool):
     def __init__(self):
         super().__init__()
 
-        self.width, self.height = pyautogui.size()
+        # self.width, self.height = pyautogui.size()
+
+        self.width = int(os.getenv("WIDTH"))
+        self.height = int(os.getenv("HEIGHT"))
 
         assert self.width and self.height, "WIDTH, HEIGHT must be set"
 
@@ -120,14 +126,16 @@ class ComputerTool(BaseAnthropicTool):
             if not all(isinstance(i, int) and i >= 0 for i in coordinate):
                 raise ToolError(f"{coordinate} must be a tuple of non-negative ints")
 
-            x, y = self.scale_coordinates(
+            x, y = self.transform_coordinates(
                 ScalingSource.API, coordinate[0], coordinate[1]
             )
 
+            x_str = f"={x}" if x < 0 else str(x)
+            y_str = f"={y}" if y < 0 else str(y)
             if action == "mouse_move":
-                return await self.shell(f"cliclick m:{x},{y}")
+                return await self.shell(f"cliclick m:{x_str},{y_str}")
             elif action == "left_click_drag":
-                return await self.shell(f"cliclick dd:{x},{y}")
+                return await self.shell(f"cliclick dd:{x_str},{y_str}")
 
         if action in ("key", "type"):
             if text is None:
@@ -211,7 +219,7 @@ class ComputerTool(BaseAnthropicTool):
 
                 if result.output:
                     x, y = map(int, result.output.strip().split(","))
-                    x, y = self.scale_coordinates(ScalingSource.COMPUTER, x, y)
+                    x, y = self.transform_coordinates(ScalingSource.COMPUTER, x, y)
                     return result.replace(output=f"X={x},Y={y}")
                 return result
             else:
@@ -239,7 +247,9 @@ class ComputerTool(BaseAnthropicTool):
         result = await self.shell(screenshot_cmd, take_screenshot=False)
 
         if self._scaling_enabled:
-            x, y = SCALE_DESTINATION["width"], SCALE_DESTINATION["height"]
+            x, y = self.scale_coordinates(
+                ScalingSource.COMPUTER, self.width, self.height
+            )
             await self.shell(
                 f"sips -z {y} {x} {path}",  # sips is macOS native image processor
                 take_screenshot=False,
@@ -279,18 +289,55 @@ class ComputerTool(BaseAnthropicTool):
         """
         if not self._scaling_enabled:
             return x, y
-
-        # Calculate scaling factors
         x_scaling_factor = SCALE_DESTINATION["width"] / self.width
         y_scaling_factor = SCALE_DESTINATION["height"] / self.height
 
         if source == ScalingSource.API:
-            # Scale up from SCALE_DESTINATION to original resolution
-            if x > SCALE_DESTINATION["width"] or y > SCALE_DESTINATION["height"]:
-                raise ToolError(
-                    f"Coordinates {x}, {y} are out of bounds for {SCALE_DESTINATION['width']}x{SCALE_DESTINATION['height']}"
-                )
+            if x > self.width or y > self.height:
+                raise ToolError(f"Coordinates {x}, {y} are out of bounds")
+            # scale up
             return round(x / x_scaling_factor), round(y / y_scaling_factor)
+        # scale down
+        return round(x * x_scaling_factor), round(y * y_scaling_factor)
+
+    def transform_coordinates(
+        self, source: ScalingSource, x: int, y: int
+    ) -> tuple[int, int]:
+        """
+        Translates and scales coordinates between:
+        - The single-monitor API space
+        - The real OS coordinate space for this LEFT monitor.
+
+        Because the monitor is on the left, its top-left in the OS
+        coordinate system is at negative X.
+
+        Example: if monitor width is 1920, then (0,0) on this monitor
+        is at real X = -1920 in the OS coordinate space.
+        """
+        if source == ScalingSource.API:
+            # 1) Scale from the API's resolution up to the real monitor resolution
+            scaled_x, scaled_y = self.scale_coordinates(ScalingSource.API, x, y)
+
+            # 2) Shift to negative X (since it's the left monitor)
+            #    (0,0) in monitor space => -real_width in OS space
+            real_x = scaled_x - self.width
+            real_y = scaled_y
+
+            print(
+                f"Transformed coordinates from API to Computer: ({x}, {y}) -> ({real_x}, {real_y})"
+            )
+            return real_x, real_y
         else:
-            # Scale down from original resolution to SCALE_DESTINATION
-            return round(x * x_scaling_factor), round(y * y_scaling_factor)
+            # source == ScalingSource.COMPUTER
+            # 1) Shift from negative OS coords to local monitor coords
+            local_x = x + self.width  # So if x = -1920, local_x = 0
+            local_y = y
+
+            # 2) Scale down from real resolution to the API resolution
+            api_x, api_y = self.scale_coordinates(
+                ScalingSource.COMPUTER, local_x, local_y
+            )
+            print(
+                f"Transformed coordinates from Computer to API: ({x}, {y}) -> ({api_x}, {api_y})"
+            )
+            return api_x, api_y
