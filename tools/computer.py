@@ -105,6 +105,9 @@ class ComputerTool(BaseAnthropicTool):
         # Read display number from environment variable
         display_num_str = os.getenv("DISPLAY_NUM")
         self.display_num = int(display_num_str) if display_num_str is not None else None
+        print(
+            f"Initialized ComputerTool with display {self.display_num}, resolution {self.width}x{self.height}"
+        )
 
     async def __call__(
         self,
@@ -114,7 +117,7 @@ class ComputerTool(BaseAnthropicTool):
         coordinate: tuple[int, int] | None = None,
         **kwargs,
     ):
-        print("Action: ", action, text, coordinate)
+        print(f"Executing action: {action} with text={text}, coordinate={coordinate}")
         if action in ("mouse_move", "left_click_drag"):
             if coordinate is None:
                 raise ToolError(f"coordinate is required for {action}")
@@ -128,6 +131,7 @@ class ComputerTool(BaseAnthropicTool):
             x, y = self.transform_coordinates(
                 ScalingSource.API, coordinate[0], coordinate[1]
             )
+            print(f"Moving mouse to transformed coordinates: ({x}, {y})")
 
             x_str = f"={x}" if x < 0 else str(x)
             y_str = f"={y}" if y < 0 else str(y)
@@ -145,6 +149,7 @@ class ComputerTool(BaseAnthropicTool):
                 raise ToolError(message=f"{text} must be a string")
 
             if action == "key":
+                print(f"Processing keyboard input: {text}")
                 # Convert common key names to pyautogui format
                 key_map = {
                     "Return": "enter",
@@ -167,12 +172,14 @@ class ComputerTool(BaseAnthropicTool):
                         # Handle combinations like "ctrl+c"
                         keys = text.split("+")
                         mapped_keys = [key_map.get(k.strip(), k.strip()) for k in keys]
+                        print(f"Executing hotkey combination: {mapped_keys}")
                         await asyncio.get_event_loop().run_in_executor(
                             None, pyautogui.hotkey, *mapped_keys
                         )
                     else:
                         # Handle single keys
                         mapped_key = key_map.get(text, text)
+                        print(f"Pressing single key: {mapped_key}")
                         await asyncio.get_event_loop().run_in_executor(
                             None, pyautogui.press, mapped_key
                         )
@@ -182,11 +189,14 @@ class ComputerTool(BaseAnthropicTool):
                     )
 
                 except Exception as e:
+                    print(f"Error executing keyboard command: {e}")
                     return ToolResult(output=None, error=str(e), base64_image=None)
             elif action == "type":
+                print(f"Typing text: {text}")
                 results: list[ToolResult] = []
                 for chunk in chunks(text, TYPING_GROUP_SIZE):
                     cmd = f"cliclick w:{TYPING_DELAY_MS} t:{shlex.quote(chunk)}"
+                    print(f"Executing typing command: {cmd}")
                     results.append(await self.shell(cmd, take_screenshot=False))
                 screenshot_base64 = (await self.screenshot()).base64_image
                 return ToolResult(
@@ -209,8 +219,10 @@ class ComputerTool(BaseAnthropicTool):
                 raise ToolError(f"coordinate is not accepted for {action}")
 
             if action == "screenshot":
+                print("Taking screenshot")
                 return await self.screenshot()
             elif action == "cursor_position":
+                print("Getting cursor position")
                 result = await self.shell(
                     "cliclick p",
                     take_screenshot=False,
@@ -219,6 +231,7 @@ class ComputerTool(BaseAnthropicTool):
                 if result.output:
                     x, y = map(int, result.output.strip().split(","))
                     x, y = self.transform_coordinates(ScalingSource.COMPUTER, x, y)
+                    print(f"Cursor position: ({x}, {y})")
                     return result.replace(output=f"X={x},Y={y}")
                 return result
             else:
@@ -228,6 +241,7 @@ class ComputerTool(BaseAnthropicTool):
                     "middle_click": "mc:.",
                     "double_click": "dc:.",
                 }[action]
+                print(f"Executing mouse click: {click_cmd}")
                 return await self.shell(f"cliclick {click_cmd}")
 
         raise ToolError(f"Invalid action: {action}")
@@ -242,19 +256,22 @@ class ComputerTool(BaseAnthropicTool):
         # If display_num is set, use it to capture specific display
         display_flag = f"-D {self.display_num}" if self.display_num is not None else ""
         screenshot_cmd = f"screencapture -x {display_flag} {path}"
-        print("screenshot_cmd", screenshot_cmd)
+        print(f"Taking screenshot with command: {screenshot_cmd}")
         result = await self.shell(screenshot_cmd, take_screenshot=False)
 
         if self._scaling_enabled:
             x, y = self.scale_coordinates(
                 ScalingSource.COMPUTER, self.width, self.height
             )
+            sips_cmd = f"sips -z {y} {x} {path}"
+            print(f"Scaling screenshot with command: {sips_cmd}")
             await self.shell(
-                f"sips -z {y} {x} {path}",  # sips is macOS native image processor
+                sips_cmd,  # sips is macOS native image processor
                 take_screenshot=False,
             )
 
         if path.exists():
+            print(f"Screenshot saved to {path}")
             return result.replace(
                 base64_image=base64.b64encode(path.read_bytes()).decode()
             )
@@ -262,10 +279,12 @@ class ComputerTool(BaseAnthropicTool):
 
     async def shell(self, command: str, take_screenshot=False) -> ToolResult:
         """Run a shell command and return the output, error, and optionally a screenshot."""
+        print(f"Executing shell command: {command}")
         _, stdout, stderr = await run(command)
         base64_image = None
 
         if take_screenshot:
+            print(f"Taking follow-up screenshot after {self._screenshot_delay}s delay")
             # delay to let things settle before taking a screenshot
             await asyncio.sleep(self._screenshot_delay)
             base64_image = (await self.screenshot()).base64_image
@@ -295,9 +314,19 @@ class ComputerTool(BaseAnthropicTool):
             if x > self.width or y > self.height:
                 raise ToolError(f"Coordinates {x}, {y} are out of bounds")
             # scale up
-            return round(x / x_scaling_factor), round(y / y_scaling_factor)
+            scaled_x = round(x / x_scaling_factor)
+            scaled_y = round(y / y_scaling_factor)
+            print(
+                f"Scaling up coordinates from API: ({x}, {y}) -> ({scaled_x}, {scaled_y})"
+            )
+            return scaled_x, scaled_y
         # scale down
-        return round(x * x_scaling_factor), round(y * y_scaling_factor)
+        scaled_x = round(x * x_scaling_factor)
+        scaled_y = round(y * y_scaling_factor)
+        print(
+            f"Scaling down coordinates to API: ({x}, {y}) -> ({scaled_x}, {scaled_y})"
+        )
+        return scaled_x, scaled_y
 
     def transform_coordinates(
         self, source: ScalingSource, x: int, y: int
