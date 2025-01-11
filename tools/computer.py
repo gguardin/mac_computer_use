@@ -3,7 +3,6 @@ import base64
 import os
 import shlex
 import pyautogui
-import keyboard
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal, TypedDict
@@ -143,7 +142,7 @@ class ComputerTool(BaseAnthropicTool):
             if coordinate is not None:
                 raise ToolError(f"coordinate is not accepted for {action}")
             if not isinstance(text, str):
-                raise ToolError(output=f"{text} must be a string")
+                raise ToolError(message=f"{text} must be a string")
 
             if action == "key":
                 # Convert common key names to pyautogui format
@@ -169,13 +168,13 @@ class ComputerTool(BaseAnthropicTool):
                         keys = text.split("+")
                         mapped_keys = [key_map.get(k.strip(), k.strip()) for k in keys]
                         await asyncio.get_event_loop().run_in_executor(
-                            None, keyboard.press_and_release, "+".join(mapped_keys)
+                            None, pyautogui.hotkey, *mapped_keys
                         )
                     else:
                         # Handle single keys
                         mapped_key = key_map.get(text, text)
                         await asyncio.get_event_loop().run_in_executor(
-                            None, keyboard.press_and_release, mapped_key
+                            None, pyautogui.press, mapped_key
                         )
 
                     return ToolResult(
