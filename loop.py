@@ -6,7 +6,10 @@ import platform
 from collections.abc import Callable
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, cast
+from typing import Any, Optional, cast
+import json
+import asyncio
+import traceback
 
 import httpx
 from anthropic import (
@@ -30,6 +33,7 @@ from anthropic.types.beta import (
 )
 
 from tools import BashTool, ComputerTool, EditTool, ToolCollection, ToolResult
+from tools.recorder import ActionRecorder
 
 COMPUTER_USE_BETA_FLAG = "computer-use-2024-10-22"
 PROMPT_CACHING_BETA_FLAG = "prompt-caching-2024-07-31"
@@ -119,10 +123,32 @@ async def sampling_loop(
     api_key: str,
     only_n_most_recent_images: int | None = None,
     max_tokens: int = 4096,
+    session_id: Optional[str] = None,
+    replay_mode: bool = False,
 ):
     """
     Agentic sampling loop for the assistant/tool interaction of computer use.
     """
+    print("\nDEBUG Sampling loop started")
+    print("\nDEBUG Replay mode:", replay_mode)
+    print("\nDEBUG Session ID:", session_id)
+    print(
+        "\nDEBUG Initial messages:",
+        json.dumps(
+            [
+                {
+                    "role": m["role"],
+                    "content_type": type(m["content"]).__name__,
+                    "content_length": (
+                        len(m["content"]) if isinstance(m["content"], list) else 1
+                    ),
+                }
+                for m in messages
+            ],
+            indent=2,
+        ),
+    )
+
     tool_collection = ToolCollection(
         ComputerTool(),
         BashTool(),
@@ -133,23 +159,75 @@ async def sampling_loop(
         text=f"{SYSTEM_PROMPT}{' ' + system_prompt_suffix if system_prompt_suffix else ''}",
     )
 
+    recorder = ActionRecorder(session_id)
+
+    if replay_mode and not session_id:
+        raise ValueError("session_id is required in replay mode")
+
+    # Initialize client outside the loop to fix linter error
+    if provider == APIProvider.ANTHROPIC:
+        client = Anthropic(api_key=api_key, max_retries=4)
+    elif provider == APIProvider.VERTEX:
+        client = AnthropicVertex()
+    elif provider == APIProvider.BEDROCK:
+        client = AnthropicBedrock()
+    else:
+        raise ValueError(f"Unsupported provider: {provider}")
+
     while True:
+        if replay_mode:
+            # In replay mode, try to get the next recorded action
+            print("\nDEBUG Checking for next action in replay mode")
+            action = recorder.get_next_action()
+            if action:
+                print("\nDEBUG Found action to replay:", json.dumps(action, indent=2))
+                # Execute the recorded action without calling the LLM
+                try:
+                    # Add a delay before executing the action
+                    await asyncio.sleep(1.5)  # 1.5 second delay between actions
+
+                    print("\nDEBUG Executing tool:", action["name"])
+                    print("\nDEBUG Tool input:", json.dumps(action["input"], indent=2))
+
+                    result = await tool_collection.run(
+                        name=action["name"],
+                        tool_input=action["input"],
+                    )
+                    print("\nDEBUG Tool execution result:", result)
+
+                    tool_output_callback(result, action.get("id", ""))
+                    messages.append(
+                        {
+                            "content": [
+                                _make_api_tool_result(result, action.get("id", ""))
+                            ],
+                            "role": "user",
+                        }
+                    )
+
+                    if recorder.is_replay_complete():
+                        print("\nDEBUG Replay complete, switching to live mode")
+                        replay_mode = False
+                    continue
+                except Exception as e:
+                    print(f"\nDEBUG Replay action failed with error: {e}")
+                    print(f"\nDEBUG Error details: {traceback.format_exc()}")
+                    replay_mode = False
+            else:
+                print("\nDEBUG No more actions to replay, switching to live mode")
+                replay_mode = False
+
+        # Normal live mode operation
         enable_prompt_caching = False
         betas = [COMPUTER_USE_BETA_FLAG]
         image_truncation_threshold = only_n_most_recent_images or 0
+
         if provider == APIProvider.ANTHROPIC:
-            client = Anthropic(api_key=api_key, max_retries=4)
             enable_prompt_caching = True
-        elif provider == APIProvider.VERTEX:
-            client = AnthropicVertex()
-        elif provider == APIProvider.BEDROCK:
-            client = AnthropicBedrock()
 
         if enable_prompt_caching:
             betas.append(PROMPT_CACHING_BETA_FLAG)
             _inject_prompt_caching(messages)
-            # Because cached reads are 10% of the price, we don't think it's
-            # ever sensible to break the cache by truncating images
             only_n_most_recent_images = 0
             system["cache_control"] = {"type": "ephemeral"}
 
@@ -160,10 +238,6 @@ async def sampling_loop(
                 min_removal_threshold=image_truncation_threshold,
             )
 
-        # Call the API
-        # we use raw_response to provide debug information to streamlit. Your
-        # implementation may be able call the SDK directly with:
-        # `response = client.messages.create(...)` instead.
         try:
             raw_response = client.beta.messages.with_raw_response.create(
                 max_tokens=max_tokens,
@@ -185,8 +259,11 @@ async def sampling_loop(
         )
 
         response = raw_response.parse()
-
         response_params = _response_to_params(response)
+
+        # Record the assistant's message
+        recorder.record_message("assistant", response_params)
+
         messages.append(
             {
                 "role": "assistant",
@@ -198,19 +275,45 @@ async def sampling_loop(
         for content_block in response_params:
             output_callback(content_block)
             if content_block["type"] == "tool_use":
-                result = await tool_collection.run(
+                # Record the tool use action
+                recorder.record_action(
+                    content_block["name"],
+                    id=content_block["id"],
+                    **content_block["input"],
+                )
+
+                # Execute the tool and get the result
+                print(
+                    "\nDEBUG Tool call parameters:",
+                    json.dumps(
+                        {
+                            "tool_name": content_block["name"],
+                            "tool_params": cast(dict[str, Any], content_block["input"]),
+                            "block": content_block,
+                        },
+                        indent=2,
+                        default=str,
+                    ),
+                )
+
+                tool_result = await tool_collection.run(
                     name=content_block["name"],
                     tool_input=cast(dict[str, Any], content_block["input"]),
                 )
+
+                # Record the tool result
+                recorder.record_tool_result(content_block["id"], tool_result)
+
                 tool_result_content.append(
-                    _make_api_tool_result(result, content_block["id"])
+                    _make_api_tool_result(tool_result, content_block["id"])
                 )
-                tool_output_callback(result, content_block["id"])
+                tool_output_callback(tool_result, content_block["id"])
 
         if not tool_result_content:
             return messages
 
         messages.append({"content": tool_result_content, "role": "user"})
+        recorder.record_message("user", tool_result_content)
 
 
 def _maybe_filter_to_n_most_recent_images(

@@ -13,6 +13,7 @@ from enum import StrEnum
 from functools import partial
 from pathlib import PosixPath
 from typing import cast
+import json
 
 import httpx
 import streamlit as st
@@ -30,6 +31,7 @@ from loop import (
     sampling_loop,
 )
 from tools import ToolResult
+from tools.recorder import ActionRecorder
 
 CONFIG_DIR = PosixPath("~/.anthropic").expanduser()
 API_KEY_FILE = CONFIG_DIR / "api_key"
@@ -92,6 +94,14 @@ def setup_state():
         st.session_state.hide_images = False
     if "in_sampling_loop" not in st.session_state:
         st.session_state.in_sampling_loop = False
+    if "session_id" not in st.session_state:
+        st.session_state.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if "replay_mode" not in st.session_state:
+        st.session_state.replay_mode = False
+    if "chat_tab" not in st.session_state:
+        st.session_state.chat_tab = None
+    if "http_logs_tab" not in st.session_state:
+        st.session_state.http_logs_tab = None
 
 
 def _reset_model():
@@ -110,6 +120,11 @@ async def main():
 
     if not os.getenv("HIDE_WARNING", False):
         st.warning(WARNING_TEXT)
+
+    # Create tabs early and store in session state
+    st.session_state.chat_tab, st.session_state.http_logs_tab = st.tabs(
+        ["Chat", "HTTP Exchange Logs"]
+    )
 
     with st.sidebar:
 
@@ -159,9 +174,78 @@ async def main():
                 st.session_state.clear()
                 setup_state()
 
-                subprocess.run("pkill Xvfb; pkill tint2", shell=True)  # noqa: ASYNC221
-                await asyncio.sleep(1)
-                subprocess.run("./start_all.sh", shell=True)  # noqa: ASYNC221
+                # subprocess.run("pkill Xvfb; pkill tint2", shell=True)  # noqa: ASYNC221
+                # await asyncio.sleep(1)
+                # subprocess.run("./start_all.sh", shell=True)  # noqa: ASYNC221
+
+        st.divider()
+        st.subheader("Recording & Replay")
+
+        # List available recordings
+        recordings = ActionRecorder.list_recordings()
+        if recordings:
+            selected_recording = st.selectbox(
+                "Select recording to replay",
+                ["None"] + recordings,
+                index=0,
+                help="Select a previous recording to replay",
+            )
+
+            if selected_recording != "None":
+                if st.button("Start Replay"):
+                    st.session_state.session_id = selected_recording
+                    st.session_state.replay_mode = True
+                    st.session_state.tools = {}  # Reset tools state
+
+                    # Initialize recorder and load tool results first
+                    recorder = ActionRecorder(selected_recording)
+                    for tool_id, result_data in recorder.recording["tools"].items():
+                        st.session_state.tools[tool_id] = ToolResult(
+                            output=result_data["output"],
+                            error=result_data["error"],
+                            base64_image=result_data["base64_image"],
+                            system=result_data.get("system"),
+                        )
+
+                    # Then load messages
+                    st.session_state.messages = recorder.get_messages()
+
+                    # Force the sampling loop to run immediately
+                    with track_sampling_loop():
+                        await sampling_loop(
+                            system_prompt_suffix=st.session_state.custom_system_prompt,
+                            model=st.session_state.model,
+                            provider=st.session_state.provider,
+                            messages=st.session_state.messages,
+                            output_callback=partial(_render_message, Sender.BOT),
+                            tool_output_callback=partial(
+                                _tool_output_callback,
+                                tool_state=st.session_state.tools,
+                            ),
+                            api_response_callback=partial(
+                                _api_response_callback,
+                                tab=st.session_state.http_logs_tab,
+                                response_state=st.session_state.responses,
+                            ),
+                            api_key=st.session_state.api_key,
+                            only_n_most_recent_images=st.session_state.only_n_most_recent_images,
+                            session_id=selected_recording,
+                            replay_mode=True,
+                        )
+                    st.rerun()
+
+                if st.button("Delete Recording", type="secondary"):
+                    ActionRecorder.delete_recording(selected_recording)
+                    st.rerun()
+        else:
+            st.info("No recordings available")
+
+        if st.session_state.replay_mode:
+            st.success("Replay mode active")
+            if st.button("Stop Replay"):
+                st.session_state.replay_mode = False
+                st.session_state.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+                st.rerun()
 
     if not st.session_state.auth_validated:
         if auth_error := validate_auth(
@@ -172,7 +256,7 @@ async def main():
         else:
             st.session_state.auth_validated = True
 
-    chat, http_logs = st.tabs(["Chat", "HTTP Exchange Logs"])
+    chat, http_logs = st.session_state.chat_tab, st.session_state.http_logs_tab
     new_message = st.chat_input(
         "Type a message to send to Claude to control the computer..."
     )
@@ -235,11 +319,13 @@ async def main():
                 ),
                 api_response_callback=partial(
                     _api_response_callback,
-                    tab=http_logs,
+                    tab=st.session_state.http_logs_tab,
                     response_state=st.session_state.responses,
                 ),
                 api_key=st.session_state.api_key,
                 only_n_most_recent_images=st.session_state.only_n_most_recent_images,
+                session_id=st.session_state.session_id,
+                replay_mode=st.session_state.replay_mode,
             )
 
 
@@ -422,6 +508,22 @@ def _render_message(
                 raise Exception(f'Unexpected response type {message["type"]}')
         else:
             st.markdown(message)
+
+
+def load_recording_messages(session_id: str) -> list:
+    """Load messages and tool results from a recording file."""
+    recorder = ActionRecorder(session_id)
+
+    # Load tool results into session state
+    for tool_id, result_data in recorder.recording["tools"].items():
+        st.session_state.tools[tool_id] = ToolResult(
+            output=result_data["output"],
+            error=result_data["error"],
+            base64_image=result_data["base64_image"],
+            system=result_data.get("system"),
+        )
+
+    return recorder.get_messages()
 
 
 if __name__ == "__main__":
