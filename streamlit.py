@@ -110,6 +110,12 @@ def _reset_model():
     ]
 
 
+def reset_state():
+    """Reset the application state to its initial values."""
+    st.session_state.clear()
+    setup_state()
+
+
 async def main():
     """Render loop for streamlit"""
     setup_state()
@@ -171,8 +177,7 @@ async def main():
 
         if st.button("Reset", type="primary"):
             with st.spinner("Resetting..."):
-                st.session_state.clear()
-                setup_state()
+                reset_state()
 
                 # subprocess.run("pkill Xvfb; pkill tint2", shell=True)  # noqa: ASYNC221
                 # await asyncio.sleep(1)
@@ -193,6 +198,9 @@ async def main():
 
             if selected_recording != "None":
                 if st.button("Start Replay"):
+                    # Reset state first
+                    reset_state()
+
                     st.session_state.session_id = selected_recording
                     st.session_state.replay_mode = True
                     st.session_state.tools = {}  # Reset tools state
