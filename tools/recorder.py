@@ -8,7 +8,7 @@ from typing import Any, Optional
 
 from .base import ToolResult
 
-RECORDINGS_DIR = Path("~/.anthropic/recordings").expanduser()
+RECORDINGS_DIR = Path("recordings").resolve()
 
 
 class ActionRecorder:

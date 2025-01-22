@@ -164,6 +164,49 @@ async def sampling_loop(
     if replay_mode and not session_id:
         raise ValueError("session_id is required in replay mode")
 
+    if replay_mode:
+        print("\nDEBUG Checking for next recorded message in replay mode")
+        if "messages" in recorder.recording:
+            print(
+                f"\nDEBUG Total messages in recording: {len(recorder.recording['messages'])}"
+            )
+            print(f"\nDEBUG Current index: {recorder.current_index}")
+            print("\nDEBUG Current messages in memory:", len(messages))
+            print("\nDEBUG Last message in memory:", json.dumps(messages[-1], indent=2))
+
+            if recorder.current_index < len(recorder.recording["messages"]):
+                next_message = recorder.recording["messages"][recorder.current_index]
+                recorder.current_index += 1
+                print(
+                    "\nDEBUG Found message to replay:",
+                    json.dumps(next_message, indent=2),
+                )
+                print("\nDEBUG Message role:", next_message["role"])
+
+                if next_message["role"] == "assistant":
+                    response_params = next_message["content"]
+                    print("\nDEBUG Set response_params from recorded message")
+                    print(
+                        "\nDEBUG Response params:",
+                        json.dumps(response_params, indent=2),
+                    )
+                    messages.append({"role": "assistant", "content": response_params})
+                    print("\nDEBUG Added assistant message, returning messages")
+                    return messages
+                else:
+                    print("\nDEBUG Adding non-assistant message")
+                    messages.append(next_message)
+                    print("\nDEBUG Messages after append:", len(messages))
+                    print(
+                        "\nDEBUG Last message now:", json.dumps(messages[-1], indent=2)
+                    )
+            else:
+                print("\nDEBUG No more messages to replay")
+                print("\nDEBUG Switching to live mode")
+                replay_mode = False
+        else:
+            print("\nDEBUG No messages found in recording")
+
     # Initialize client outside the loop to fix linter error
     if provider == APIProvider.ANTHROPIC:
         client = Anthropic(api_key=api_key, max_retries=4)
@@ -175,95 +218,83 @@ async def sampling_loop(
         raise ValueError(f"Unsupported provider: {provider}")
 
     while True:
+        print("\nDEBUG Starting main loop iteration")
+        # Get next response - either from recording or live LLM
+        response_params = None
+
         if replay_mode:
-            # In replay mode, try to get the next recorded action
-            print("\nDEBUG Checking for next action in replay mode")
-            action = recorder.get_next_action()
-            if action:
-                print("\nDEBUG Found action to replay:", json.dumps(action, indent=2))
-                # Execute the recorded action without calling the LLM
-                try:
-                    # Add a delay before executing the action
-                    await asyncio.sleep(1.5)  # 1.5 second delay between actions
-
-                    print("\nDEBUG Executing tool:", action["name"])
-                    print("\nDEBUG Tool input:", json.dumps(action["input"], indent=2))
-
-                    result = await tool_collection.run(
-                        name=action["name"],
-                        tool_input=action["input"],
+            print("\nDEBUG In replay mode, checking for recorded message")
+            if hasattr(recorder.recording, "messages"):
+                print(
+                    f"\nDEBUG Total messages in recording: {len(recorder.recording['messages'])}"
+                )
+                print(f"\nDEBUG Current index: {recorder.current_index}")
+                if recorder.current_index < len(recorder.recording["messages"]):
+                    next_message = recorder.recording["messages"][
+                        recorder.current_index
+                    ]
+                    recorder.current_index += 1
+                    print(
+                        "\nDEBUG Found message to replay in main loop:",
+                        json.dumps(next_message, indent=2),
                     )
-                    print("\nDEBUG Tool execution result:", result)
-
-                    tool_output_callback(result, action.get("id", ""))
-                    messages.append(
-                        {
-                            "content": [
-                                _make_api_tool_result(result, action.get("id", ""))
-                            ],
-                            "role": "user",
-                        }
-                    )
-
-                    if recorder.is_replay_complete():
-                        print("\nDEBUG Replay complete, switching to live mode")
-                        replay_mode = False
-                    continue
-                except Exception as e:
-                    print(f"\nDEBUG Replay action failed with error: {e}")
-                    print(f"\nDEBUG Error details: {traceback.format_exc()}")
-                    replay_mode = False
+                    response_params = next_message["content"]
+                    print("\nDEBUG Set response_params in main loop")
+                else:
+                    print("\nDEBUG No more messages to replay in main loop")
             else:
-                print("\nDEBUG No more actions to replay, switching to live mode")
-                replay_mode = False
+                print("\nDEBUG No messages found in recording in main loop")
 
-        # Normal live mode operation
-        enable_prompt_caching = False
-        betas = [COMPUTER_USE_BETA_FLAG]
-        image_truncation_threshold = only_n_most_recent_images or 0
+        # If no recorded message, get response from LLM
+        if response_params is None:
+            print("\nDEBUG No recorded message, getting response from LLM")
+            enable_prompt_caching = False
+            betas = [COMPUTER_USE_BETA_FLAG]
+            image_truncation_threshold = only_n_most_recent_images or 0
 
-        if provider == APIProvider.ANTHROPIC:
-            enable_prompt_caching = True
+            if provider == APIProvider.ANTHROPIC:
+                enable_prompt_caching = True
 
-        if enable_prompt_caching:
-            betas.append(PROMPT_CACHING_BETA_FLAG)
-            _inject_prompt_caching(messages)
-            only_n_most_recent_images = 0
-            system["cache_control"] = {"type": "ephemeral"}
+            if enable_prompt_caching:
+                betas.append(PROMPT_CACHING_BETA_FLAG)
+                _inject_prompt_caching(messages)
+                only_n_most_recent_images = 0
+                system["cache_control"] = {"type": "ephemeral"}
 
-        if only_n_most_recent_images:
-            _maybe_filter_to_n_most_recent_images(
-                messages,
-                only_n_most_recent_images,
-                min_removal_threshold=image_truncation_threshold,
+            if only_n_most_recent_images:
+                _maybe_filter_to_n_most_recent_images(
+                    messages,
+                    only_n_most_recent_images,
+                    min_removal_threshold=image_truncation_threshold,
+                )
+
+            try:
+                raw_response = client.beta.messages.with_raw_response.create(
+                    max_tokens=max_tokens,
+                    messages=messages,
+                    model=model,
+                    system=[system],
+                    tools=tool_collection.to_params(),
+                    betas=betas,
+                )
+            except (APIStatusError, APIResponseValidationError) as e:
+                api_response_callback(e.request, e.response, e)
+                return messages
+            except APIError as e:
+                api_response_callback(e.request, e.body, e)
+                return messages
+
+            api_response_callback(
+                raw_response.http_response.request, raw_response.http_response, None
             )
 
-        try:
-            raw_response = client.beta.messages.with_raw_response.create(
-                max_tokens=max_tokens,
-                messages=messages,
-                model=model,
-                system=[system],
-                tools=tool_collection.to_params(),
-                betas=betas,
-            )
-        except (APIStatusError, APIResponseValidationError) as e:
-            api_response_callback(e.request, e.response, e)
-            return messages
-        except APIError as e:
-            api_response_callback(e.request, e.body, e)
-            return messages
+            response = raw_response.parse()
+            response_params = _response_to_params(response)
 
-        api_response_callback(
-            raw_response.http_response.request, raw_response.http_response, None
-        )
+            # Record the assistant's message
+            recorder.record_message("assistant", response_params)
 
-        response = raw_response.parse()
-        response_params = _response_to_params(response)
-
-        # Record the assistant's message
-        recorder.record_message("assistant", response_params)
-
+        # Common path for processing response, whether from replay or LLM
         messages.append(
             {
                 "role": "assistant",
@@ -314,6 +345,8 @@ async def sampling_loop(
 
         messages.append({"content": tool_result_content, "role": "user"})
         recorder.record_message("user", tool_result_content)
+
+        return messages
 
 
 def _maybe_filter_to_n_most_recent_images(
