@@ -11,9 +11,11 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 from enum import StrEnum
 from functools import partial
-from pathlib import PosixPath
-from typing import cast
+from pathlib import PosixPath, Path
+from typing import cast, Optional
 import json
+import logging
+import sys
 
 import httpx
 import streamlit as st
@@ -32,6 +34,15 @@ from loop import (
 )
 from tools import ToolResult
 from tools.recorder import ActionRecorder
+from utils import safe_dumps
+
+
+log_format = "%(asctime)s [%(levelname)s] %(name)s - %(message)s"
+logging.basicConfig(level=logging.INFO, format=log_format, datefmt="%Y-%m-%d %H:%M:%S")
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
 
 CONFIG_DIR = PosixPath("~/.anthropic").expanduser()
 API_KEY_FILE = CONFIG_DIR / "api_key"
@@ -96,12 +107,12 @@ def setup_state():
         st.session_state.in_sampling_loop = False
     if "session_id" not in st.session_state:
         st.session_state.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    if "replay_mode" not in st.session_state:
-        st.session_state.replay_mode = False
     if "chat_tab" not in st.session_state:
         st.session_state.chat_tab = None
     if "http_logs_tab" not in st.session_state:
         st.session_state.http_logs_tab = None
+    if "replay_mode" not in st.session_state:
+        st.session_state.replay_mode = False
 
 
 def _reset_model():
@@ -112,6 +123,8 @@ def _reset_model():
 
 def reset_state():
     """Reset the application state to its initial values."""
+    # Reset recorder instance before clearing state
+    ActionRecorder.reset_instance()
     st.session_state.clear()
     setup_state()
 
@@ -181,6 +194,8 @@ async def main():
                 # subprocess.run("pkill Xvfb; pkill tint2", shell=True)  # noqa: ASYNC221
                 # await asyncio.sleep(1)
                 # subprocess.run("./start_all.sh", shell=True)  # noqa: ASYNC221
+                # Force rerun to ensure UI elements are recreated
+                st.rerun()
 
         st.divider()
         st.subheader("Recording & Replay")
@@ -197,57 +212,22 @@ async def main():
 
             if selected_recording != "None":
                 if st.button("Start Replay"):
-                    print("\nDEBUG Starting replay mode")
                     # Reset state first
                     reset_state()
 
-                    print(f"\nDEBUG Setting session ID to: {selected_recording}")
+                    # Set session ID and initialize recorder with the selected recording
                     st.session_state.session_id = selected_recording
+                    # This will create a new instance since we just reset it
+                    recorder = ActionRecorder.get_instance(selected_recording)
+                    if not recorder.in_replay_mode:
+                        st.error("Failed to initialize replay mode")
+                        return
+
+                    # Set replay mode state
                     st.session_state.replay_mode = True
-                    st.session_state.tools = {}  # Reset tools state
-
-                    # Initialize recorder and load tool results first
-                    print("\nDEBUG Initializing recorder")
-                    recorder = ActionRecorder(selected_recording)
-                    print(
-                        f"\nDEBUG Recording contents: {json.dumps(_truncate_base64_image(recorder.recording), indent=2)}"
+                    st.success(
+                        f"Replay mode active - replaying recording {selected_recording}"
                     )
-
-                    print("\nDEBUG Loading tool results")
-                    for tool_id, result_data in recorder.recording["tools"].items():
-                        print(f"\nDEBUG Loading tool result for ID: {tool_id}")
-                        truncated_result = _truncate_base64_image(result_data)
-                        print(
-                            f"\nDEBUG Tool result data: {json.dumps(truncated_result, indent=2)}"
-                        )
-                        st.session_state.tools[tool_id] = ToolResult(
-                            output=result_data["output"],
-                            error=result_data["error"],
-                            base64_image=result_data["base64_image"],
-                            system=result_data.get("system"),
-                        )
-
-                    # Load first user message to start the conversation
-                    print("\nDEBUG Loading first message")
-                    if "messages" in recorder.recording:
-                        messages = recorder.recording["messages"]
-                        print(f"\nDEBUG Found {len(messages)} messages in recording")
-                        if messages:
-                            # Add a user message to trigger the sampling loop
-                            st.session_state.messages.append(
-                                {
-                                    "role": "user",
-                                    "content": [
-                                        BetaTextBlockParam(
-                                            type="text", text="[REPLAY START]"
-                                        )
-                                    ],
-                                }
-                            )
-                            print(
-                                "\nDEBUG Added initial user message to trigger sampling loop"
-                            )
-
                     st.rerun()
 
                 if st.button("Delete Recording", type="secondary"):
@@ -256,11 +236,17 @@ async def main():
         else:
             st.info("No recordings available")
 
+        # Show replay mode status
         if st.session_state.replay_mode:
-            st.success("Replay mode active")
+            st.success("🔄 Replay Mode Active")
             if st.button("Stop Replay"):
+                # Reset recorder instance when stopping replay
+                ActionRecorder.reset_instance()
+                new_session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+                st.session_state.session_id = new_session_id
                 st.session_state.replay_mode = False
-                st.session_state.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+                # Initialize new recorder with the new session ID
+                ActionRecorder.get_instance(new_session_id)
                 st.rerun()
 
     if not st.session_state.auth_validated:
@@ -273,66 +259,59 @@ async def main():
             st.session_state.auth_validated = True
 
     chat, http_logs = st.session_state.chat_tab, st.session_state.http_logs_tab
-    new_message = st.chat_input(
-        "Type a message to send to Claude to control the computer..."
-    )
+
+    # Handle new message (from user input or replay)
+    new_message = None
+    if st.session_state.replay_mode:
+        recorder = ActionRecorder.get_instance(st.session_state.session_id)
+        if not recorder.in_replay_mode:
+            st.error("Replay mode inconsistency detected. Stopping replay.")
+            st.session_state.replay_mode = False
+            st.rerun()
+            return
+
+        user_message = recorder.get_next_message()
+
+        # If no more messages, stop replay
+        if user_message is None:
+            logger.info("No more messages in recording")
+            st.info("Replay completed")
+            st.session_state.replay_mode = False
+            st.rerun()
+            return
+
+        # Only use user messages at this point
+        if user_message["role"] != "user":
+            logger.debug("Skipping non-user message in replay mode")
+            return
+
+        new_message = user_message["content"]
+        if isinstance(new_message, list):
+            text_blocks = [block for block in new_message if block["type"] == "text"]
+            if text_blocks:
+                new_message = text_blocks[0]["text"]
+            else:
+                new_message = None
+    else:
+        new_message = st.chat_input(
+            "Type a message to send to Claude to control the computer..."
+        )
 
     with chat:
         # render past chats
-        print(f"\nDEBUG Current messages in session: {len(st.session_state.messages)}")
-        print(
-            "\nDEBUG All messages in session:",
-            json.dumps(
-                [
-                    {
-                        "role": m["role"],
-                        "content_type": type(m["content"]).__name__,
-                        "content": (
-                            _truncate_base64_image(m["content"])
-                            if isinstance(m["content"], (dict, list))
-                            else m["content"]
-                        ),
-                    }
-                    for m in st.session_state.messages
-                ],
-                indent=2,
-            ),
-        )
+        logger.info("Current messages in session: %d", len(st.session_state.messages))
 
+        # Render existing messages
         for message in st.session_state.messages:
-            message_info = {
-                "role": message["role"],
-                "content_type": type(message["content"]).__name__,
-                "content": (
-                    _truncate_base64_image(message["content"])
-                    if isinstance(message["content"], (dict, list))
-                    else message["content"]
-                ),
-            }
-            print(f"\nDEBUG Rendering message: {json.dumps(message_info, indent=2)}")
             if isinstance(message["content"], str):
-                print("\nDEBUG Rendering string content")
                 _render_message(message["role"], message["content"])
             elif isinstance(message["content"], list):
-                print("\nDEBUG Rendering list content")
                 for block in message["content"]:
-                    block_info = (
-                        _truncate_base64_image(block)
-                        if isinstance(block, dict)
-                        else block
-                    )
-                    print(
-                        f"\nDEBUG Processing content block: {json.dumps(block_info, indent=2)}"
-                    )
-                    # the tool result we send back to the Anthropic API isn't sufficient to render all details,
-                    # so we store the tool use responses
                     if isinstance(block, dict) and block["type"] == "tool_result":
-                        print("\nDEBUG Rendering tool result")
                         _render_message(
                             Sender.TOOL, st.session_state.tools[block["tool_use_id"]]
                         )
                     else:
-                        print("\nDEBUG Rendering non-tool content")
                         _render_message(
                             message["role"],
                             cast(BetaContentBlockParam | ToolResult, block),
@@ -342,91 +321,61 @@ async def main():
         for identity, (request, response) in st.session_state.responses.items():
             _render_api_response(request, response, identity, http_logs)
 
-        # render past chats
         if new_message:
-            st.session_state.messages.append(
-                {
-                    "role": Sender.USER,
-                    "content": [
-                        *maybe_add_interruption_blocks(),
-                        BetaTextBlockParam(type="text", text=new_message),
-                    ],
-                }
-            )
+            message = {
+                "role": Sender.USER,
+                "content": [
+                    *maybe_add_interruption_blocks(),
+                    BetaTextBlockParam(type="text", text=new_message),
+                ],
+            }
+            st.session_state.messages.append(message)
+
+            if not st.session_state.replay_mode:
+                recorder = ActionRecorder.get_instance(st.session_state.session_id)
+                recorder.record_message(message)
+
             _render_message(Sender.USER, new_message)
 
-        try:
-            most_recent_message = st.session_state["messages"][-1]
-        except IndexError:
-            return
+            try:
+                most_recent_message = st.session_state["messages"][-1]
+            except IndexError:
+                return
 
-        print(f"\nDEBUG Most recent message: {most_recent_message}")
-        print(f"DEBUG Role type: {type(most_recent_message['role'])}")
-        print(f"DEBUG Sender.USER type: {type(Sender.USER)}")
-        print(f"DEBUG Role value: {most_recent_message['role']}")
-        print(f"DEBUG Sender.USER value: {Sender.USER}")
+            logger.debug("Most recent message: %s", most_recent_message)
+            logger.debug("Role type: %s", type(most_recent_message["role"]))
+            logger.debug("Sender.USER type: %s", type(Sender.USER))
+            logger.debug("Role value: %s", most_recent_message["role"])
+            logger.debug("Sender.USER value: %s", Sender.USER)
 
-        if most_recent_message["role"] != Sender.USER:
-            print("DEBUG: Exiting because role is not USER")
-            return
+            if most_recent_message["role"] != Sender.USER:
+                logger.warning("Exiting because role is not USER")
+                return
 
-        with track_sampling_loop():
-            # run the agent sampling loop with the newest message
-            print(
-                "\nDEBUG Before sampling loop - messages:",
-                json.dumps(
-                    [
-                        {"role": m["role"], "content_type": type(m["content"]).__name__}
-                        for m in st.session_state.messages
-                    ],
-                    indent=2,
-                ),
-            )
+            with track_sampling_loop():
+                # run the agent sampling loop with the newest message
 
-            updated_messages = await sampling_loop(
-                system_prompt_suffix=st.session_state.custom_system_prompt,
-                model=st.session_state.model,
-                provider=st.session_state.provider,
-                messages=st.session_state.messages,
-                output_callback=partial(_render_message, Sender.BOT),
-                tool_output_callback=partial(
-                    _tool_output_callback, tool_state=st.session_state.tools
-                ),
-                api_response_callback=partial(
-                    _api_response_callback,
-                    tab=st.session_state.http_logs_tab,
-                    response_state=st.session_state.responses,
-                ),
-                api_key=st.session_state.api_key,
-                only_n_most_recent_images=st.session_state.only_n_most_recent_images,
-                session_id=st.session_state.session_id,
-                replay_mode=st.session_state.replay_mode,
-            )
+                updated_messages = await sampling_loop(
+                    system_prompt_suffix=st.session_state.custom_system_prompt,
+                    model=st.session_state.model,
+                    provider=st.session_state.provider,
+                    messages=st.session_state.messages,
+                    output_callback=partial(_render_message, Sender.BOT),
+                    tool_output_callback=partial(
+                        _tool_output_callback, tool_state=st.session_state.tools
+                    ),
+                    api_response_callback=partial(
+                        _api_response_callback,
+                        tab=st.session_state.http_logs_tab,
+                        response_state=st.session_state.responses,
+                    ),
+                    api_key=st.session_state.api_key,
+                    only_n_most_recent_images=st.session_state.only_n_most_recent_images,
+                    session_id=st.session_state.session_id,
+                )
 
-            print(
-                "\nDEBUG After sampling loop - updated messages:",
-                json.dumps(
-                    [
-                        {"role": m["role"], "content_type": type(m["content"]).__name__}
-                        for m in updated_messages
-                    ],
-                    indent=2,
-                ),
-            )
-
-            st.session_state.messages = updated_messages
-            print(
-                "\nDEBUG After updating session state - messages:",
-                json.dumps(
-                    [
-                        {"role": m["role"], "content_type": type(m["content"]).__name__}
-                        for m in st.session_state.messages
-                    ],
-                    indent=2,
-                ),
-            )
-
-            st.rerun()
+                st.session_state.messages = updated_messages
+                st.rerun()
 
 
 def maybe_add_interruption_blocks():
@@ -492,7 +441,7 @@ def load_from_storage(filename: str) -> str | None:
             if data:
                 return data
     except Exception as e:
-        st.write(f"Debug: Error loading {filename}: {e}")
+        logger.error("Error loading %s: %s", filename, e)
     return None
 
 
@@ -505,7 +454,7 @@ def save_to_storage(filename: str, data: str) -> None:
         # Ensure only user can read/write the file
         file_path.chmod(0o600)
     except Exception as e:
-        st.write(f"Debug: Error saving {filename}: {e}")
+        logger.error("Error saving %s: %s", filename, e)
 
 
 def _api_response_callback(
@@ -521,6 +470,7 @@ def _api_response_callback(
     response_id = datetime.now().isoformat()
     response_state[response_id] = (request, response)
     if error:
+        logger.error("API error: %s", error)
         _render_error(error)
     _render_api_response(request, response, response_id, tab)
 
@@ -546,13 +496,22 @@ def _render_api_response(
             st.markdown(
                 f"`{request.method} {request.url}`{newline}{newline.join(f'`{k}: {v}`' for k, v in request.headers.items())}"
             )
-            st.json(request.read().decode())
+            try:
+                st.json(request.read().decode())
+            except Exception as e:
+                logger.error("Error decoding request body: %s", e)
+                st.error("Error decoding request body")
+
             st.markdown("---")
             if isinstance(response, httpx.Response):
                 st.markdown(
                     f"`{response.status_code}`{newline}{newline.join(f'`{k}: {v}`' for k, v in response.headers.items())}"
                 )
-                st.json(response.text)
+                try:
+                    st.json(response.text)
+                except Exception as e:
+                    logger.error("Error decoding response body: %s", e)
+                    st.error("Error decoding response body")
             else:
                 st.write(response)
 
@@ -569,6 +528,7 @@ def _render_error(error: Exception):
         lines = "\n".join(traceback.format_exception(error))
         body += f"\n\n```{lines}```"
     save_to_storage(f"error_{datetime.now().timestamp()}.md", body)
+    logger.error("%s\n\n%s", error.__class__.__name__, body)
     st.error(f"**{error.__class__.__name__}**\n\n{body}", icon=":material/error:")
 
 
@@ -587,6 +547,17 @@ def _render_message(
     ):
         return
     with st.chat_message(sender):
+        message_info = {
+            "role": sender,
+            "content_type": type(message).__name__,
+            "content": (
+                message if isinstance(message, (str, dict)) else message.__dict__
+            ),
+        }
+        logger.info(
+            f"Rendering message: {safe_dumps(message_info)}",
+            extra={"section": "UI", "emoji": "🎨"},
+        )
         if is_tool_result:
             message = cast(ToolResult, message)
             if message.output:
@@ -599,6 +570,11 @@ def _render_message(
             if message.base64_image and not st.session_state.hide_images:
                 st.image(base64.b64decode(message.base64_image))
         elif isinstance(message, dict):
+            block_info = message
+            logger.info(
+                f"Processing content block: {safe_dumps(block_info)}",
+                extra={"section": "UI", "emoji": "🔄"},
+            )
             if message["type"] == "text":
                 st.write(message["text"])
             elif message["type"] == "tool_use":
@@ -624,26 +600,6 @@ def load_recording_messages(session_id: str) -> list:
         )
 
     return recorder.get_messages()
-
-
-def _truncate_base64_image(data: dict) -> dict:
-    """Truncate base64 image data for logging purposes."""
-    if isinstance(data, dict):
-        result = {}
-        for k, v in data.items():
-            if (k == "base64_image" or k == "data") and isinstance(v, str):
-                result[k] = v[:50] + "..." if v else v
-            elif isinstance(v, dict):
-                result[k] = _truncate_base64_image(v)
-            elif isinstance(v, list):
-                result[k] = [
-                    _truncate_base64_image(item) if isinstance(item, dict) else item
-                    for item in v
-                ]
-            else:
-                result[k] = v
-        return result
-    return data
 
 
 if __name__ == "__main__":

@@ -1,0 +1,17 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Streamlit",
+            "type": "python",
+            "request": "launch",
+            "program": "/Users/gguardin/Library/Caches/pypoetry/virtualenvs/mac-computer-use-gWtiqSC4-py3.12/bin/streamlit",
+            "args": [
+                "run",
+                "streamlit.py"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true
+        }
+    ]
+}
