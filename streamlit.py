@@ -5,17 +5,14 @@ Entrypoint for streamlit, see https://docs.streamlit.io/
 import asyncio
 import base64
 import os
-import subprocess
 import traceback
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from enum import StrEnum
 from functools import partial
-from pathlib import PosixPath, Path
-from typing import cast, Optional
-import json
+from pathlib import PosixPath
+from typing import cast
 import logging
-import sys
 
 import httpx
 import streamlit as st
@@ -37,11 +34,13 @@ from tools.recorder import ActionRecorder
 from utils import safe_dumps
 
 
-log_format = "%(asctime)s [%(levelname)s] %(name)s - %(message)s"
-logging.basicConfig(level=logging.INFO, format=log_format, datefmt="%Y-%m-%d %H:%M:%S")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
 
 
 CONFIG_DIR = PosixPath("~/.anthropic").expanduser()

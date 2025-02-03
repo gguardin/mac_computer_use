@@ -1,42 +1,15 @@
 """Tool for recording and replaying computer control actions."""
 
 import json
-import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 import logging
-import sys
 
-from .base import ToolResult
-from tools import ToolResult
 from utils import safe_dumps
 
 # Configure logging
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
-
-# Create formatters
-log_format = "%(asctime)s [%(levelname)s] %(name)s - %(message)s"
-detailed_formatter = logging.Formatter(log_format, datefmt="%Y-%m-%d %H:%M:%S")
-
-# Console handler
-console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setLevel(logging.INFO)
-console_handler.setFormatter(detailed_formatter)
-
-# File handler
-log_dir = Path("logs")
-log_dir.mkdir(exist_ok=True)
-file_handler = logging.FileHandler(
-    log_dir / f"mac_computer_use_{datetime.now().strftime('%Y%m%d')}.log"
-)
-file_handler.setLevel(logging.DEBUG)
-file_handler.setFormatter(detailed_formatter)
-
-# Add handlers
-logger.addHandler(console_handler)
-logger.addHandler(file_handler)
 
 RECORDINGS_DIR = Path("recordings").resolve()
 
@@ -91,7 +64,7 @@ class ActionRecorder:
         if self.recording_file.exists():
             logger.info("Loading existing recording file")
             self._in_replay_mode = True
-            with open(self.recording_file) as f:
+            with open(self.recording_file, encoding="utf-8") as f:
                 self.recording = json.load(f)
             logger.debug("Loaded recording data: %s", safe_dumps(self.recording))
         else:
@@ -128,11 +101,11 @@ class ActionRecorder:
     def skip_user_message(self):
         """Skip the next user message."""
         if self.current_index >= len(self.recording["messages"]):
-            logger.warn("No more messages available")
+            logger.warning("No more messages available")
             return
 
         if self.recording["messages"][self.current_index]["role"] != "user":
-            logger.warn("Next message is not a user message")
+            logger.warning("Next message is not a user message")
             return
 
         self.current_index += 1
@@ -152,7 +125,7 @@ class ActionRecorder:
     def save(self):
         """Save the current recording to file."""
         logger.debug("Saving recording to file: %s", self.recording_file)
-        with open(self.recording_file, "w") as f:
+        with open(self.recording_file, "w", encoding="utf-8") as f:
             json.dump(self.recording, f, indent=2)
         logger.info("Recording saved successfully")
 
